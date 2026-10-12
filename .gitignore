@@ -1,0 +1,11 @@
+# Sensitive Configuration
+config.php
+
+# Dependency Directories
+/vendor/
+/PHPMailer/
+
+# System / IDE Files
+.DS_Store
+.vscode/
+.idea/
