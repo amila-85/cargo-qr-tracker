@@ -1,20 +1,10 @@
 <?php
 session_start();
-if (!isset($_SESSION['user_id'])) {
-    header("Location: login.php");
-    exit;
-}
 
-$currentUser = 'User';
-if (!empty($_SESSION['full_name'])) {
-    $currentUser = $_SESSION['full_name'];
-} elseif (!empty($_SESSION['username'])) {
-    $currentUser = $_SESSION['username'];
-}
-
+$currentUser = $_SESSION['full_name'] ?? $_SESSION['username'] ?? 'User';
 $userRole = $_SESSION['role'] ?? 'Staff'; 
 $isAdmin = (strtolower($userRole) === 'admin' || strtolower($userRole) === 'system admin');
-?>?>
+?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -23,6 +13,15 @@ $isAdmin = (strtolower($userRole) === 'admin' || strtolower($userRole) === 'syst
     <title>ECO Cargo - QR Scanner</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <script src="https://unpkg.com/html5-qrcode" type="text/javascript"></script>
+    <script>
+        // Check if user is authenticated via PHP Session OR local offline backup
+        const phpUserId = "<?= $_SESSION['user_id'] ?? '' ?>";
+        const localUser = localStorage.getItem('eco_user');
+
+        if (!phpUserId && !localUser) {
+            window.location.href = 'login.php';
+        }
+    </script>
     <style>
         #reader { width: 100%; max-width: 500px; margin: 0 auto; }
         .result-card { display: none; }
@@ -49,7 +48,7 @@ $isAdmin = (strtolower($userRole) === 'admin' || strtolower($userRole) === 'syst
 
     <!-- Offline Alert -->
     <div id="offlineAlert" class="alert alert-warning d-none text-center" role="alert">
-        <strong>Offline Mode Active:</strong> Scans & updates will be saved locally and auto-synced when online.
+        <strong>Offline Mode Active:</strong> Using local database cache. Scans & updates will auto-sync when reconnected.
         <span id="pendingCount" class="badge bg-dark ms-2">0 Pending</span>
     </div>
 
@@ -134,9 +133,18 @@ $isAdmin = (strtolower($userRole) === 'admin' || strtolower($userRole) === 'syst
     let html5QrcodeScanner;
     let currentTrackingNumber = '';
     let lastChangedSelect = 'origin';
-    const currentUser = "<?= addslashes($currentUser) ?>";
-    const userRole = "<?= addslashes($userRole) ?>";
-    const isAdmin = <?= $isAdmin ? 'true' : 'false' ?>;
+
+    // Safe PHP-to-JS binding with localStorage fallback
+    let cachedProfile = null;
+    try { cachedProfile = JSON.parse(localStorage.getItem('eco_user')); } catch(e){}
+
+    const serverUser = <?= json_encode($currentUser) ?>;
+    const serverRole = <?= json_encode($userRole) ?>;
+    const serverIsAdmin = <?= $isAdmin ? 'true' : 'false' ?>;
+
+    const currentUser = (serverUser && serverUser !== 'User') ? serverUser : (cachedProfile ? cachedProfile.full_name : 'User');
+    const userRole = (serverRole && serverRole !== 'Staff') ? serverRole : (cachedProfile ? cachedProfile.role : 'Staff');
+    const isAdmin = serverIsAdmin || (cachedProfile && (cachedProfile.role.toLowerCase() === 'admin' || cachedProfile.role.toLowerCase() === 'system admin'));
 
     const statusOrder = [
         "1. Warehouse",
@@ -149,13 +157,14 @@ $isAdmin = (strtolower($userRole) === 'admin' || strtolower($userRole) === 'syst
         "8. Delivered"
     ];
 
-    // --- INDEXEDDB SETUP FOR OFFLINE SYNC ---
+    // --- INDEXEDDB SETUP FOR OFFLINE CACHE & QUEUE ---
     let db;
     const dbName = "EcoCargoOfflineDB";
-    const storeName = "pendingUpdates";
+    const storePending = "pendingUpdates";
+    const storeCache = "shipmentCache";
 
     function initIndexedDB() {
-        const request = indexedDB.open(dbName, 1);
+        const request = indexedDB.open(dbName, 2);
         request.onerror = () => console.error("IndexedDB error");
         request.onsuccess = (event) => {
             db = event.target.result;
@@ -166,28 +175,50 @@ $isAdmin = (strtolower($userRole) === 'admin' || strtolower($userRole) === 'syst
         };
         request.onupgradeneeded = (event) => {
             db = event.target.result;
-            if (!db.objectStoreNames.contains(storeName)) {
-                db.createObjectStore(storeName, { keyPath: "id", autoIncrement: true });
+            if (!db.objectStoreNames.contains(storePending)) {
+                db.createObjectStore(storePending, { keyPath: "id", autoIncrement: true });
+            }
+            if (!db.objectStoreNames.contains(storeCache)) {
+                db.createObjectStore(storeCache, { keyPath: "TrackingNumber" });
             }
         };
     }
 
+    function cacheShipment(item) {
+        if (!db) return;
+        const transaction = db.transaction([storeCache], "readwrite");
+        const store = transaction.objectStore(storeCache);
+        store.put(item);
+    }
+
+    function getCachedShipment(trackingNumber, callback) {
+        if (!db) {
+            callback(null);
+            return;
+        }
+        const transaction = db.transaction([storeCache], "readonly");
+        const store = transaction.objectStore(storeCache);
+        const request = store.get(trackingNumber);
+        request.onsuccess = () => callback(request.result);
+        request.onerror = () => callback(null);
+    }
+
     function saveToOfflineQueue(payload) {
         if (!db) return;
-        const transaction = db.transaction([storeName], "readwrite");
-        const store = transaction.objectStore(storeName);
+        const transaction = db.transaction([storePending], "readwrite");
+        const store = transaction.objectStore(storePending);
         store.add(payload);
         transaction.oncomplete = () => {
             updatePendingBadge();
-            alert("Network offline: Status update saved locally and will sync when reconnected.");
+            alert("Offline Mode: Status update saved locally. It will auto-sync when online.");
             resetScanner();
         };
     }
 
     function updatePendingBadge() {
         if (!db) return;
-        const transaction = db.transaction([storeName], "readonly");
-        const store = transaction.objectStore(storeName);
+        const transaction = db.transaction([storePending], "readonly");
+        const store = transaction.objectStore(storePending);
         const countRequest = store.count();
         countRequest.onsuccess = () => {
             const count = countRequest.result;
@@ -197,9 +228,9 @@ $isAdmin = (strtolower($userRole) === 'admin' || strtolower($userRole) === 'syst
     }
 
     function syncOfflineQueue() {
-        if (!db || !navigator.onLine) return;
-        const transaction = db.transaction([storeName], "readwrite");
-        const store = transaction.objectStore(storeName);
+        if (!db) return;
+        const transaction = db.transaction([storePending], "readwrite");
+        const store = transaction.objectStore(storePending);
         const getAllRequest = store.getAll();
 
         getAllRequest.onsuccess = () => {
@@ -215,9 +246,8 @@ $isAdmin = (strtolower($userRole) === 'admin' || strtolower($userRole) === 'syst
                 .then(res => res.json())
                 .then(data => {
                     if (data.status === 'success') {
-                        // Delete successfully synced item
-                        const delTx = db.transaction([storeName], "readwrite");
-                        delTx.objectStore(storeName).delete(item.id);
+                        const delTx = db.transaction([storePending], "readwrite");
+                        delTx.objectStore(storePending).delete(item.id);
                         delTx.oncomplete = () => updatePendingBadge();
                     }
                 })
@@ -226,7 +256,6 @@ $isAdmin = (strtolower($userRole) === 'admin' || strtolower($userRole) === 'syst
         };
     }
 
-    // Network Event Listeners
     window.addEventListener('online', () => {
         document.getElementById('networkBadge').className = "badge bg-success me-3";
         document.getElementById('networkBadge').innerText = "Online";
@@ -241,46 +270,58 @@ $isAdmin = (strtolower($userRole) === 'admin' || strtolower($userRole) === 'syst
     });
 
     // --- APPLICATION LOGIC ---
+    function displayShipment(item) {
+        currentTrackingNumber = item.TrackingNumber;
+        document.getElementById('resTracking').innerText = `Tracking: ${item.TrackingNumber}`;
+        document.getElementById('resInvoice').innerText = item.InvoiceNumber;
+        document.getElementById('resBoxInfo').innerText = `${item.BoxSize} (${item.BoxType})`;
+        document.getElementById('resSender').innerText = item.SenderName;
+        document.getElementById('resReceiver').innerText = item.ReceiverName;
+        document.getElementById('resReceiverEmail').innerText = item.ReceiverEmail ? item.ReceiverEmail : 'No Email On File';
+
+        const currentStatus = item.Status || '1. Warehouse';
+        document.getElementById('resStatus').innerText = currentStatus;
+        document.getElementById('resUpdatedBy').innerText = item.UpdatedBy ? item.UpdatedBy : 'Not Updated Yet';
+        document.getElementById('resUpdatedAt').innerText = item.UpdatedAt ? item.UpdatedAt : 'Not Updated Yet';
+
+        configureStatusDropdowns(currentStatus);
+
+        document.getElementById('scannerCard').style.display = 'none';
+        document.getElementById('resultCard').style.display = 'block';
+    }
+
     function fetchShipmentDetails(trackingNumber) {
-        if (!trackingNumber.trim()) {
+        const cleanCode = trackingNumber.trim();
+        if (!cleanCode) {
             alert("Please enter or scan a valid tracking number.");
             return;
         }
 
-        if (!navigator.onLine) {
-            // Offline fallback simulation
-            alert("Offline Mode: Unable to fetch live server records. Proceeding with manual status notation.");
-            return;
-        }
-
-        fetch(`api_scan.php?trackingNumber=${encodeURIComponent(trackingNumber.trim())}`)
+        fetch(`api_scan.php?trackingNumber=${encodeURIComponent(cleanCode)}`)
             .then(res => res.json())
             .then(data => {
                 if (data.status === 'success') {
-                    const item = data.data;
-                    currentTrackingNumber = item.TrackingNumber;
-                    document.getElementById('resTracking').innerText = `Tracking: ${item.TrackingNumber}`;
-                    document.getElementById('resInvoice').innerText = item.InvoiceNumber;
-                    document.getElementById('resBoxInfo').innerText = `${item.BoxSize} (${item.BoxType})`;
-                    document.getElementById('resSender').innerText = item.SenderName;
-                    document.getElementById('resReceiver').innerText = item.ReceiverName;
-                    document.getElementById('resReceiverEmail').innerText = item.ReceiverEmail ? item.ReceiverEmail : 'No Email On File';
-
-                    const currentStatus = item.Status || '1. Warehouse';
-
-                    document.getElementById('resStatus').innerText = currentStatus;
-                    document.getElementById('resUpdatedBy').innerText = item.UpdatedBy ? item.UpdatedBy : 'Not Updated Yet';
-                    document.getElementById('resUpdatedAt').innerText = item.UpdatedAt ? item.UpdatedAt : 'Not Updated Yet';
-
-                    configureStatusDropdowns(currentStatus);
-
-                    document.getElementById('scannerCard').style.display = 'none';
-                    document.getElementById('resultCard').style.display = 'block';
+                    cacheShipment(data.data);
+                    displayShipment(data.data);
                 } else {
-                    alert(data.message || "Shipment record not found.");
+                    getCachedShipment(cleanCode, (cachedItem) => {
+                        if (cachedItem) {
+                            displayShipment(cachedItem);
+                        } else {
+                            alert(data.message || "Shipment record not found.");
+                        }
+                    });
                 }
             })
-            .catch(() => alert("Network error connecting to server."));
+            .catch(() => {
+                getCachedShipment(cleanCode, (cachedItem) => {
+                    if (cachedItem) {
+                        displayShipment(cachedItem);
+                    } else {
+                        alert("Offline: Shipment not found in local cache. Please connect to the local server at least once while online.");
+                    }
+                });
+            });
     }
 
     function handleManualSearch() {
@@ -294,37 +335,41 @@ $isAdmin = (strtolower($userRole) === 'admin' || strtolower($userRole) === 'syst
 
         if (isAdmin) {
             const adminSelect = document.getElementById('adminStatusSelect');
-            adminSelect.value = currentStatus;
-            Array.from(adminSelect.options).forEach(opt => opt.disabled = false);
+            if (adminSelect) {
+                adminSelect.value = currentStatus;
+                Array.from(adminSelect.options).forEach(opt => opt.disabled = false);
+            }
         } else {
             const originSelect = document.getElementById('originStatusSelect');
             const destSelect = document.getElementById('destStatusSelect');
             const stage2Container = document.getElementById('stage2Container');
 
-            if (currentIndex >= shippedIndex) {
-                originSelect.value = "4. Shipped to Destination Country";
-                originSelect.disabled = true;
+            if (originSelect && destSelect) {
+                if (currentIndex >= shippedIndex) {
+                    originSelect.value = "4. Shipped to Destination Country";
+                    originSelect.disabled = true;
 
-                stage2Container.classList.remove('d-none');
-                destSelect.disabled = false;
-                destSelect.value = currentIndex > shippedIndex ? currentStatus : "5. Arrived at Destination Port";
-                lastChangedSelect = 'dest';
-            } else {
-                originSelect.disabled = false;
-                originSelect.value = currentStatus;
-                stage2Container.classList.add('d-none');
-                lastChangedSelect = 'origin';
+                    if (stage2Container) stage2Container.classList.remove('d-none');
+                    destSelect.disabled = false;
+                    destSelect.value = currentIndex > shippedIndex ? currentStatus : "5. Arrived at Destination Port";
+                    lastChangedSelect = 'dest';
+                } else {
+                    originSelect.disabled = false;
+                    originSelect.value = currentStatus;
+                    if (stage2Container) stage2Container.classList.add('d-none');
+                    lastChangedSelect = 'origin';
+                }
+
+                Array.from(originSelect.options).forEach(opt => {
+                    const optIndex = statusOrder.indexOf(opt.value);
+                    opt.disabled = (optIndex < currentIndex);
+                });
+
+                Array.from(destSelect.options).forEach(opt => {
+                    const optIndex = statusOrder.indexOf(opt.value);
+                    opt.disabled = (optIndex < currentIndex);
+                });
             }
-
-            Array.from(originSelect.options).forEach(opt => {
-                const optIndex = statusOrder.indexOf(opt.value);
-                opt.disabled = (optIndex < currentIndex);
-            });
-
-            Array.from(destSelect.options).forEach(opt => {
-                const optIndex = statusOrder.indexOf(opt.value);
-                opt.disabled = (optIndex < currentIndex);
-            });
         }
     }
 
@@ -338,7 +383,7 @@ $isAdmin = (strtolower($userRole) === 'admin' || strtolower($userRole) === 'syst
             const destSelect = document.getElementById('destStatusSelect');
             const stage2Container = document.getElementById('stage2Container');
 
-            if (lastChangedSelect === 'dest' && !stage2Container.classList.contains('d-none') && !destSelect.disabled) {
+            if (lastChangedSelect === 'dest' && stage2Container && !stage2Container.classList.contains('d-none') && !destSelect.disabled) {
                 selectedStatus = destSelect.value;
             } else {
                 selectedStatus = originSelect.value;
@@ -376,7 +421,6 @@ $isAdmin = (strtolower($userRole) === 'admin' || strtolower($userRole) === 'syst
             }
         })
         .catch(() => {
-            // Fallback if fetch drops mid-request
             saveToOfflineQueue(payload);
         });
     }
@@ -406,6 +450,9 @@ $isAdmin = (strtolower($userRole) === 'admin' || strtolower($userRole) === 'syst
     }
 
     window.onload = () => {
+        if (document.getElementById('currentUserSpan')) document.getElementById('currentUserSpan').innerText = currentUser;
+        if (document.getElementById('userRoleSpan')) document.getElementById('userRoleSpan').innerText = userRole;
+
         initIndexedDB();
         initScanner();
     };
